@@ -141,6 +141,65 @@ func TestParseCertificates(t *testing.T) {
 	}
 }
 
+func TestParseCertificateBundle(t *testing.T) {
+	tests := []struct {
+		name             string
+		data             []byte
+		wantCount        int
+		wantFingerprints []string
+		wantErr          bool
+	}{{
+		name:             "single certificate",
+		data:             []byte(testCertPEM),
+		wantCount:        1,
+		wantFingerprints: []string{testCertPEMFingerprint},
+	}, {
+		name:             "two certificates",
+		data:             []byte(testCertPEM + "\n" + testCertPEM2),
+		wantCount:        2,
+		wantFingerprints: []string{testCertPEMFingerprint, testCertPEM2Fingerprint},
+	}, {
+		name:      "empty data",
+		data:      []byte{},
+		wantCount: 0,
+	}, {
+		name:      "non-certificate PEM block skipped",
+		data:      []byte("-----BEGIN OTHER-----\nYWJj\n-----END OTHER-----\n" + testCertPEM),
+		wantCount: 1,
+		wantFingerprints: []string{testCertPEMFingerprint},
+	}, {
+		name:    "invalid certificate DER",
+		data:    []byte("-----BEGIN CERTIFICATE-----\nbm90YWNlcnQ=\n-----END CERTIFICATE-----\n"),
+		wantErr: true,
+	}}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			certs, err := parseCertificateBundle(tt.data)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error but got none")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(certs) != tt.wantCount {
+				t.Errorf("got %d certs, want %d", len(certs), tt.wantCount)
+			}
+			for i, fp := range tt.wantFingerprints {
+				if i >= len(certs) {
+					break
+				}
+				if diff := cmp.Diff(fp, certs[i].fingerprint); diff != "" {
+					t.Errorf("cert[%d] fingerprint mismatch (-want +got):\n%s", i, diff)
+				}
+			}
+		})
+	}
+}
+
 func TestInstallCertificates(t *testing.T) {
 	epoch := time.Unix(1337, 0)
 	t.Setenv("SOURCE_DATE_EPOCH", fmt.Sprintf("%d", epoch.Unix()))
@@ -299,6 +358,93 @@ func TestInstallCertificates(t *testing.T) {
 				"test-cert-2-" + testCertPEM2Fingerprint: testCertPEM2,
 			}),
 		},
+	}, {
+		// Package-installed cert (no system bundle exists): cert file is preserved
+		// unchanged; no bundle is created.
+		name: "package cert without existing bundle",
+		cfg:  nil,
+		existingFiles: map[string][]byte{
+			filepath.Join(packageCACertsDir, "custom", "my-ca.crt"): []byte(testCertPEM),
+		},
+		wantFiles: map[string][]byte{
+			filepath.Join(packageCACertsDir, "custom", "my-ca.crt"): []byte(testCertPEM),
+		},
+	}, {
+		// Package-installed cert gets compiled into existing system bundle.
+		name: "package cert compiled into existing bundle",
+		cfg:  nil,
+		existingFiles: map[string][]byte{
+			caBundlePaths[0]: []byte("# Existing CA Bundle\n"),
+			filepath.Join(packageCACertsDir, "custom", "my-ca.crt"): []byte(testCertPEM),
+		},
+		wantFiles: map[string][]byte{
+			caBundlePaths[0]: []byte("# Existing CA Bundle\n" + testCertPEM + "\n"),
+			filepath.Join(packageCACertsDir, "custom", "my-ca.crt"): []byte(testCertPEM),
+		},
+	}, {
+		// Multiple package certs from different subdirectories are compiled in sorted order.
+		// acme/ sorts before dod/ so testCertPEM (acme) comes before testCertPEM2 (dod).
+		name: "package certs in multiple subdirectories compiled in sorted order",
+		cfg:  nil,
+		existingFiles: map[string][]byte{
+			caBundlePaths[0]: []byte("# Existing CA Bundle\n"),
+			filepath.Join(packageCACertsDir, "acme", "acme-root-ca.crt"): []byte(testCertPEM),
+			filepath.Join(packageCACertsDir, "dod", "DoD_Root_CA_3.crt"): []byte(testCertPEM2),
+		},
+		wantFiles: map[string][]byte{
+			caBundlePaths[0]: []byte("# Existing CA Bundle\n" + testCertPEM + "\n" + testCertPEM2 + "\n"),
+			filepath.Join(packageCACertsDir, "acme", "acme-root-ca.crt"): []byte(testCertPEM),
+			filepath.Join(packageCACertsDir, "dod", "DoD_Root_CA_3.crt"):  []byte(testCertPEM2),
+		},
+	}, {
+		// A .crt file containing multiple certs (a bundle) is handled: both certs appended.
+		name: "package multi-cert bundle file",
+		cfg:  nil,
+		existingFiles: map[string][]byte{
+			caBundlePaths[0]: []byte("# Existing CA Bundle\n"),
+			filepath.Join(packageCACertsDir, "custom", "bundle.crt"): []byte(testCertPEM + "\n" + testCertPEM2),
+		},
+		wantFiles: map[string][]byte{
+			caBundlePaths[0]: []byte("# Existing CA Bundle\n" + testCertPEM + "\n" + testCertPEM2 + "\n"),
+			filepath.Join(packageCACertsDir, "custom", "bundle.crt"): []byte(testCertPEM + "\n" + testCertPEM2),
+		},
+	}, {
+		// Both inline (certificates.additional) and package-installed certs are compiled.
+		// Explicit cert comes first (processed before package scan); then package cert.
+		name: "combined explicit and package certs",
+		cfg: &types.ImageCertificates{
+			Additional: []types.AdditionalCertificateEntry{
+				{Name: "explicit-cert", Content: testCertPEM},
+			},
+		},
+		existingFiles: map[string][]byte{
+			caBundlePaths[0]: []byte("# Existing CA Bundle\n"),
+			filepath.Join(packageCACertsDir, "custom", "pkg-cert.crt"): []byte(testCertPEM2),
+		},
+		wantFiles: map[string][]byte{
+			caBundlePaths[0]: []byte("# Existing CA Bundle\n" + testCertPEM + "\n" + testCertPEM2 + "\n"),
+			filepath.Join(caCertsDir, fmt.Sprintf("explicit-cert-%s.crt", testCertPEMFingerprint)): []byte(testCertPEM),
+			filepath.Join(packageCACertsDir, "custom", "pkg-cert.crt"):                             []byte(testCertPEM2),
+		},
+	}, {
+		// Package cert is also added to Java truststore with alias "{filename}-{fingerprint}".
+		name: "package cert with Java truststore",
+		cfg:  nil,
+		existingFiles: map[string][]byte{
+			caBundlePaths[0]: []byte("# Existing CA Bundle\n"),
+			javaTruststorePaths[0]: createTruststore(map[string]string{
+				"existing": testCertPEM,
+			}),
+			filepath.Join(packageCACertsDir, "dod", "DoD_Root_CA_3.crt"): []byte(testCertPEM2),
+		},
+		wantFiles: map[string][]byte{
+			caBundlePaths[0]: []byte("# Existing CA Bundle\n" + testCertPEM2 + "\n"),
+			javaTruststorePaths[0]: createTruststore(map[string]string{
+				"existing":                                        testCertPEM,
+				"DoD_Root_CA_3-" + testCertPEM2Fingerprint: testCertPEM2,
+			}),
+			filepath.Join(packageCACertsDir, "dod", "DoD_Root_CA_3.crt"): []byte(testCertPEM2),
+		},
 	}}
 
 	for _, tt := range tests {
@@ -331,7 +477,7 @@ func TestInstallCertificates(t *testing.T) {
 				// Expected error, nothing further to check
 				return
 			}
-			if tt.cfg == nil || len(tt.cfg.Additional) == 0 {
+			if len(tt.wantFiles) == 0 {
 				// Nothing further to check
 				return
 			}
