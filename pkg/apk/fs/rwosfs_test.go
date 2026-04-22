@@ -384,6 +384,44 @@ func TestOpenFileWriteReadCaching(t *testing.T) {
 	require.Equal(t, testData, readData, "ReadFile should return correct data after OpenFile/Write/Close")
 }
 
+// TestSetuidModeOpenFile verifies that files with setuid/setgid/sticky bits
+// can be created through OpenFile and WriteFile. os.Root.OpenFile rejects
+// modes with bits above 0o777, so dirFS must strip those bits for the on-disk
+// call while preserving the full mode in the in-memory overrides.
+func TestSetuidModeOpenFile(t *testing.T) {
+	dir := t.TempDir()
+	fsys := DirFS(t.Context(), dir)
+	require.NotNil(t, fsys, "fs should be created")
+
+	// setuid (4755) as seen in packages like mount
+	setuidMode := os.FileMode(0o4755)
+	f, err := fsys.OpenFile("suid-binary", os.O_CREATE|os.O_WRONLY, setuidMode)
+	require.NoError(t, err, "OpenFile with setuid mode should succeed")
+	_, err = f.Write([]byte("binary"))
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	fi, err := fsys.Stat("suid-binary")
+	require.NoError(t, err)
+	require.Equal(t, setuidMode, fi.Mode(), "in-memory mode should preserve setuid bit")
+
+	// setgid (2755)
+	setgidMode := os.FileMode(0o2755)
+	require.NoError(t, fsys.WriteFile("sgid-binary", []byte("binary"), setgidMode))
+
+	fi, err = fsys.Stat("sgid-binary")
+	require.NoError(t, err)
+	require.Equal(t, setgidMode, fi.Mode(), "in-memory mode should preserve setgid bit")
+
+	// sticky (1755)
+	stickyMode := os.FileMode(0o1755)
+	require.NoError(t, fsys.WriteFile("sticky-binary", []byte("binary"), stickyMode))
+
+	fi, err = fsys.Stat("sticky-binary")
+	require.NoError(t, err)
+	require.Equal(t, stickyMode, fi.Mode(), "in-memory mode should preserve sticky bit")
+}
+
 // TestScriptsTarPattern tests the exact pattern used by updateScriptsTar:
 // 1. Stat the file
 // 2. ReadFile to get existing content

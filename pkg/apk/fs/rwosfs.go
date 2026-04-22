@@ -329,14 +329,18 @@ func (f *dirFS) OpenFile(name string, flag int, perm fs.FileMode) (File, error) 
 		// do we create it on disk?
 		if f.createOnDisk(name) {
 			_ = file.Close()
-			file, err = f.root.OpenFile(f.relPath(name), flag, perm)
+			// *os.Root rejects type/setuid/setgid/sticky bits in the mode;
+			// strip to permission bits. The full mode is tracked in overrides.
+			file, err = f.root.OpenFile(f.relPath(name), flag, perm.Perm())
 			if err != nil {
 				return nil, err
 			}
 		}
 	} else {
 		if f.caseSensitiveOnDisk(name) {
-			file, err = f.root.OpenFile(f.relPath(name), flag, perm)
+			// *os.Root rejects type/setuid/setgid/sticky bits in the mode;
+			// strip to permission bits. The full mode is tracked in overrides.
+			file, err = f.root.OpenFile(f.relPath(name), flag, perm.Perm())
 		} else {
 			file, err = f.overrides.OpenFile(name, flag, perm)
 		}
@@ -469,7 +473,9 @@ func (f *dirFS) ReadFile(name string) ([]byte, error) {
 }
 func (f *dirFS) WriteFile(name string, b []byte, mode fs.FileMode) error {
 	if f.createOnDisk(name) {
-		if err := f.root.WriteFile(f.relPath(name), b, mode); err != nil {
+		// *os.Root rejects type/setuid/setgid/sticky bits in the mode;
+		// strip to permission bits. The full mode is tracked in overrides.
+		if err := f.root.WriteFile(f.relPath(name), b, mode.Perm()); err != nil {
 			return err
 		}
 	}
